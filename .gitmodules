@@ -1,3 +1,4 @@
 [submodule "lib/hami-core"]
 	path = lib/hami-core
-	url = https://github.com/Project-HAMi/HAMi-core
+	url = https://github.com/loiht2/HAMi-core-fix-memory.git
+	branch = fix/container-memory
