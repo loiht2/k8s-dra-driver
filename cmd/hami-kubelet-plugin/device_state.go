@@ -41,6 +41,7 @@ type OpaqueDeviceConfig struct {
 
 type DeviceConfigState struct {
 	MpsControlDaemonID string `json:"mpsControlDaemonID"`
+	CacheDir           string `json:"cacheDir,omitempty"`
 	containerEdits     *cdiapi.ContainerEdits
 }
 
@@ -93,7 +94,7 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 	var mpsManager *MpsManager
 	var vfioPciManager *VfioPciManager
 	if featuregates.Enabled(featuregates.HAMiCoreSupport) {
-		hamiCoreManager = NewHAMiCoreManager(nvdevlib)
+		hamiCoreManager = NewHAMiCoreManager(nvdevlib, config.clientsets.Core)
 	} else {
 	  if featuregates.Enabled(featuregates.TimeSlicingSettings) {
 	  	tsManager = NewTimeSlicingManager(nvdevlib)
@@ -473,7 +474,7 @@ func (s *DeviceState) prepareDevices(ctx context.Context, claim *resourceapi.Res
 func (s *DeviceState) unprepareDevices(ctx context.Context, claimUID string, devices PreparedDevices) error {
 	for _, group := range devices {
 		if featuregates.Enabled(featuregates.HAMiCoreSupport) {
-		  err := s.hamiCoreManager.Cleanup(claimUID, group.Devices.HAMiGpus())
+		  err := s.hamiCoreManager.Cleanup(group.ConfigState.CacheDir)
 		  if err != nil {
 		  	return fmt.Errorf("error cleanup hami devices: %w", err)
 		  }
@@ -591,7 +592,12 @@ func (s *DeviceState) applySharingConfig(ctx context.Context, config configapi.S
 
 
 	if featuregates.Enabled(featuregates.HAMiCoreSupport) {
-		configState.containerEdits = s.hamiCoreManager.GetCDIContainerEdits(claim, allocatableDevices)
+		edits, cacheDir, err := s.hamiCoreManager.GetCDIContainerEdits(ctx, claim, allocatableDevices)
+		if err != nil {
+			klog.Warningf("error getting HAMi-core CDI container edits for claim %s: %v", claim.UID, err)
+		}
+		configState.containerEdits = edits
+		configState.CacheDir = cacheDir
 	} else {
 	  // Apply time-slicing settings (if available and feature gate enabled).
 	  if featuregates.Enabled(featuregates.TimeSlicingSettings) && config.IsTimeSlicing() {

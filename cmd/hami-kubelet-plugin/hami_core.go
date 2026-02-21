@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"os"
@@ -32,7 +33,9 @@ import (
 	"github.com/urfave/cli/v2"
 
 	resourceapi "k8s.io/api/resource/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	coreclientset "k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/utils/ptr"
@@ -206,12 +209,14 @@ func (g *PreparedDeviceGroup) HAMIGpuUUIDs() []string {
 type HAMiCoreManager struct {
 	hostHookPath string
 	nvdevlib     *deviceLib
+	clientset    coreclientset.Interface
 }
 
-func NewHAMiCoreManager(deviceLib *deviceLib) *HAMiCoreManager {
+func NewHAMiCoreManager(deviceLib *deviceLib, clientset coreclientset.Interface) *HAMiCoreManager {
 	return &HAMiCoreManager{
 		nvdevlib:     deviceLib,
 		hostHookPath: "/usr/local",
+		clientset:    clientset,
 	}
 }
 
@@ -227,38 +232,98 @@ func (m *HAMiCoreManager) getConsumableCapacityMap(claim *resourceapi.ResourceCl
 	return resMap
 }
 
-func (m *HAMiCoreManager) GetCDIContainerEdits(claim *resourceapi.ResourceClaim, devs AllocatableDevices) *cdiapi.ContainerEdits {
-	cacheFileHostDirectory := fmt.Sprintf("%s/vgpu/claims/%s", m.hostHookPath, claim.UID)
-	// TODO: We should check the status of claim, becasue there may be two pod share the claim
-	var err error
-	err = os.RemoveAll(cacheFileHostDirectory)
-	if err != nil {
-		klog.Warningf("Failed to remove host directory for cachefile %s: %s", cacheFileHostDirectory, err)
-	}
-	err = os.MkdirAll(cacheFileHostDirectory, 0777)
-	if err != nil {
-		klog.Warningf("Failed to create host directory for cachefile %s: %s", cacheFileHostDirectory, err)
-	}
-	err = os.Chmod(cacheFileHostDirectory, 0777)
-	if err != nil {
-		klog.Warningf("Failed to change mod of host directory for cachefile %s: %s", cacheFileHostDirectory, err)
+// resolveContainerInfo looks up the pod and container that reserved this claim.
+// Returns (podUID, containerName, error). If the claim is reserved by multiple
+// consumers or the container cannot be determined, containerName will be empty.
+func (m *HAMiCoreManager) resolveContainerInfo(ctx context.Context, claim *resourceapi.ResourceClaim) (string, string, error) {
+	if len(claim.Status.ReservedFor) == 0 {
+		return "", "", fmt.Errorf("claim %s has no consumers in ReservedFor", claim.Name)
 	}
 
+	consumer := claim.Status.ReservedFor[0]
+	podUID := string(consumer.UID)
+
+	// Fetch the pod to find which container references this claim
+	pod, err := m.clientset.CoreV1().Pods(claim.Namespace).Get(ctx, consumer.Name, metav1.GetOptions{})
+	if err != nil {
+		return podUID, "", fmt.Errorf("failed to get pod %s/%s: %w", claim.Namespace, consumer.Name, err)
+	}
+
+	// Find which pod-level claim reference name corresponds to this ResourceClaim
+	var podClaimName string
+	for _, rc := range pod.Spec.ResourceClaims {
+		if rc.ResourceClaimName != nil && *rc.ResourceClaimName == claim.Name {
+			podClaimName = rc.Name
+			break
+		}
+	}
+	if podClaimName == "" {
+		return podUID, "", fmt.Errorf("could not find claim reference for %s in pod %s/%s", claim.Name, pod.Namespace, pod.Name)
+	}
+
+	// Find the container that uses this claim
+	for _, ctr := range pod.Spec.Containers {
+		for _, rc := range ctr.Resources.Claims {
+			if rc.Name == podClaimName {
+				return podUID, ctr.Name, nil
+			}
+		}
+	}
+	for _, ctr := range pod.Spec.InitContainers {
+		for _, rc := range ctr.Resources.Claims {
+			if rc.Name == podClaimName {
+				return podUID, ctr.Name, nil
+			}
+		}
+	}
+
+	return podUID, "", fmt.Errorf("no container found referencing claim %s in pod %s/%s", claim.Name, pod.Namespace, pod.Name)
+}
+
+// GetCDIContainerEdits creates the CDI container edits for HAMi-core.
+// It creates the cache directory under containers/{podUID}_{containerName}/ so
+// that the existing vGPU monitor (ContainerLister) can discover and report
+// real-time GPU memory usage for DRA-allocated containers.
+// Returns the container edits, the host-side cache directory path, and an error.
+func (m *HAMiCoreManager) GetCDIContainerEdits(ctx context.Context, claim *resourceapi.ResourceClaim, devs AllocatableDevices) (*cdiapi.ContainerEdits, string, error) {
+	// Resolve pod UID and container name from the claim's ReservedFor field
+	podUID, containerName, err := m.resolveContainerInfo(ctx, claim)
+
+	var cacheFileHostDirectory string
+	if err != nil || containerName == "" {
+		// Fallback: use claim UID under containers/ dir.
+		// The monitor won't fully parse this, but it keeps the cache files
+		// in a discoverable location.
+		klog.Warningf("Could not resolve container info for claim %s (pod %s), falling back to claim-based directory: %v", claim.Name, podUID, err)
+		cacheFileHostDirectory = fmt.Sprintf("%s/vgpu/containers/%s", m.hostHookPath, claim.UID)
+	} else {
+		cacheFileHostDirectory = fmt.Sprintf("%s/vgpu/containers/%s_%s", m.hostHookPath, podUID, containerName)
+	}
+
+	if removeErr := os.RemoveAll(cacheFileHostDirectory); removeErr != nil {
+		klog.Warningf("Failed to remove host directory for cachefile %s: %s", cacheFileHostDirectory, removeErr)
+	}
+	if mkdirErr := os.MkdirAll(cacheFileHostDirectory, 0777); mkdirErr != nil {
+		klog.Warningf("Failed to create host directory for cachefile %s: %s", cacheFileHostDirectory, mkdirErr)
+	}
+	if chmodErr := os.Chmod(cacheFileHostDirectory, 0777); chmodErr != nil {
+		klog.Warningf("Failed to change mod of host directory for cachefile %s: %s", cacheFileHostDirectory, chmodErr)
+	}
+	os.MkdirAll("/tmp/vgpulock", 0777)
+	os.Chmod("/tmp/vgpulock", 0777)
+
 	hamiEnvs := []string{}
-	// TOOD: Get SM Limit from Claim's Annotation
-	hamiEnvs = append(hamiEnvs, fmt.Sprintf("CUDA_DEVICE_MEMORY_SHARED_CACHE=%s", fmt.Sprintf("%s/%v.cache", cacheFileHostDirectory, uuid.New().String())))
+	hamiEnvs = append(hamiEnvs, fmt.Sprintf("CUDA_DEVICE_MEMORY_SHARED_CACHE=%s/%v.cache", cacheFileHostDirectory, uuid.New().String()))
 
 	devCapMap := m.getConsumableCapacityMap(claim)
 	idx := 0
 	for name, dev := range devs {
-		// TODO: The idx here may not equals to the index in nvidia-smi, So we need to find a solution to solve it
-		klog.Warningf("HAMiCoreManager GetCDIContainerEdits for dev: %s\n", name)
+		klog.Infof("HAMiCoreManager GetCDIContainerEdits for dev: %s", name)
 		capNameSMLimit := resourceapi.QualifiedName("cores")
 		capNameMemoryLimit := resourceapi.QualifiedName("memory")
 		SMLimitEnv := fmt.Sprintf("CUDA_DEVICE_SM_LIMIT_%d=%s", idx, "60")
-		memoryLimit := string(strconv.FormatUint(dev.HAMiGpu.memoryBytes/1024/1024, 10)) + "m"
+		memoryLimit := strconv.FormatUint(dev.HAMiGpu.memoryBytes/1024/1024, 10) + "m"
 		MemoryLimitEnv := fmt.Sprintf("CUDA_DEVICE_MEMORY_LIMIT_%d=%s", idx, memoryLimit)
-		// TODO: Loop in a map getting from HAMiCoreManager
 		if _, ok := devCapMap[name]; ok {
 			if _, ok := devCapMap[name][capNameSMLimit]; ok {
 				q := devCapMap[name][capNameSMLimit]
@@ -306,12 +371,18 @@ func (m *HAMiCoreManager) GetCDIContainerEdits(claim *resourceapi.ResourceClaim,
 				},
 			},
 		},
-	}
+	}, cacheFileHostDirectory, nil
 }
 
-func (m *HAMiCoreManager) Cleanup(claimUID string, pl PreparedDeviceList) error {
-	path := fmt.Sprintf("%s/vgpu/claims/%s", m.hostHookPath, claimUID)
-	_ = os.RemoveAll(path)
+// Cleanup removes the cache directory created during Prepare.
+// cacheDir is the host-side directory path stored in DeviceConfigState.CacheDir.
+func (m *HAMiCoreManager) Cleanup(cacheDir string) error {
+	if cacheDir == "" {
+		klog.Warning("Cleanup called with empty cacheDir, skipping")
+		return nil
+	}
+	klog.Infof("Cleaning up HAMi-core cache directory: %s", cacheDir)
+	_ = os.RemoveAll(cacheDir)
 	return nil
 }
 
