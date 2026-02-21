@@ -105,6 +105,41 @@ spec:
           name: host-vgpu
         - mountPath: /tmp
           name: host-tmp
+      - name: vgpu-monitor
+        image: projecthami/hami:latest
+        imagePullPolicy: IfNotPresent
+        command:
+          - vGPUmonitor
+          - -v=4
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+            add: ["SYS_ADMIN"]
+        env:
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+          - name: NVIDIA_VISIBLE_DEVICES
+            value: "all"
+          - name: NVIDIA_MIG_MONITOR_DEVICES
+            value: "all"
+          - name: HOOK_PATH
+            value: "/usr/local/vgpu"
+        volumeMounts:
+          - name: host-vgpu-containers
+            mountPath: /usr/local/vgpu/containers
+          - name: host-tmp
+            mountPath: /tmp
+          - name: host-docker
+            mountPath: /run/docker
+          - name: host-containerd
+            mountPath: /run/containerd
+          - name: host-sys
+            mountPath: /sysinfo
+          - name: host-var
+            mountPath: /hostvar
       dnsPolicy: ClusterFirst
       serviceAccount: hami-dra-driver-service-account
       serviceAccountName: hami-dra-driver-service-account
@@ -138,6 +173,26 @@ spec:
           type: DirectoryOrCreate
         name: host-vgpu
       - hostPath:
+          path: /usr/local/vgpu/containers
+          type: DirectoryOrCreate
+        name: host-vgpu-containers
+      - hostPath:
           path: /tmp
           type: ""
         name: host-tmp
+      - hostPath:
+          path: /run/docker
+          type: ""
+        name: host-docker
+      - hostPath:
+          path: /run/containerd
+          type: ""
+        name: host-containerd
+      - hostPath:
+          path: /sys
+          type: ""
+        name: host-sys
+      - hostPath:
+          path: /var
+          type: ""
+        name: host-var
