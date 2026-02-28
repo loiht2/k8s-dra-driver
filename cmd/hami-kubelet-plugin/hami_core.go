@@ -249,12 +249,25 @@ func (m *HAMiCoreManager) resolveContainerInfo(ctx context.Context, claim *resou
 		return podUID, "", fmt.Errorf("failed to get pod %s/%s: %w", claim.Namespace, consumer.Name, err)
 	}
 
-	// Find which pod-level claim reference name corresponds to this ResourceClaim
+	// Find which pod-level claim reference name corresponds to this ResourceClaim.
+	// Two cases:
+	//   1) Directly referenced claims: rc.ResourceClaimName == claim.Name
+	//   2) Template-based claims:      pod.Status.ResourceClaimStatuses maps
+	//      the template ref name to the auto-generated claim name.
 	var podClaimName string
 	for _, rc := range pod.Spec.ResourceClaims {
 		if rc.ResourceClaimName != nil && *rc.ResourceClaimName == claim.Name {
 			podClaimName = rc.Name
 			break
+		}
+	}
+	// If not found via ResourceClaimName, check template-based claims via pod status
+	if podClaimName == "" {
+		for _, rcs := range pod.Status.ResourceClaimStatuses {
+			if rcs.ResourceClaimName != nil && *rcs.ResourceClaimName == claim.Name {
+				podClaimName = rcs.Name
+				break
+			}
 		}
 	}
 	if podClaimName == "" {
