@@ -382,6 +382,12 @@ func (m *HAMiCoreManager) GetCDIContainerEdits(ctx context.Context, claim *resou
 					HostPath:      "/tmp/vgpulock",
 					Options:       []string{"rw", "nosuid", "nodev", "bind"},
 				},
+				// Memory resizer DaemonSet UDS socket
+				{
+					ContainerPath: "/var/run/hami",
+					HostPath:      "/var/run/hami",
+					Options:       []string{"rw", "nosuid", "nodev", "bind"},
+				},
 			},
 		},
 	}, cacheFileHostDirectory, nil
