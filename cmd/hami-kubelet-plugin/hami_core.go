@@ -23,29 +23,24 @@ import (
 	"os"
 	"slices"
 	"strconv"
-	"strings"
 
-	"github.com/google/uuid"
 	"github.com/Masterminds/semver"
-	nvdev "github.com/NVIDIA/go-nvlib/pkg/nvlib/device"
-	"github.com/Project-HAMi/k8s-dra-driver/pkg/featuregates"
-	"github.com/spf13/pflag"
-	"github.com/urfave/cli/v2"
+	"github.com/google/uuid"
 
 	resourceapi "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	coreclientset "k8s.io/client-go/kubernetes"
-	"k8s.io/klog/v2"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
+	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
 
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
 	cdispec "tags.cncf.io/container-device-interface/specs-go"
 )
 
-
 // For deviceinfo.goh
+// TODO: Implements a String method for HAMIGpuInfo
 type HAMiGpuInfo struct {
 	GpuInfo
 }
@@ -98,8 +93,8 @@ func (d *HAMiGpuInfo) GetDevice() resourceapi.Device {
 				RequestPolicy: &resourceapi.CapacityRequestPolicy{
 					Default: resource.NewQuantity(int64(100), resource.DecimalSI),
 					ValidRange: &resourceapi.CapacityRequestPolicyRange{
-						Min: resource.NewQuantity(int64(0), resource.DecimalSI),
-						Max: resource.NewQuantity(int64(100), resource.DecimalSI),
+						Min:  resource.NewQuantity(int64(0), resource.DecimalSI),
+						Max:  resource.NewQuantity(int64(100), resource.DecimalSI),
 						Step: resource.NewQuantity(int64(1), resource.DecimalSI),
 					},
 				},
@@ -109,8 +104,8 @@ func (d *HAMiGpuInfo) GetDevice() resourceapi.Device {
 				RequestPolicy: &resourceapi.CapacityRequestPolicy{
 					Default: resource.NewQuantity(int64(d.memoryBytes), resource.BinarySI),
 					ValidRange: &resourceapi.CapacityRequestPolicyRange{
-						Min: resource.NewQuantity(int64(1048576), resource.BinarySI),
-						Max: resource.NewQuantity(int64(d.memoryBytes), resource.BinarySI),
+						Min:  resource.NewQuantity(int64(1048576), resource.BinarySI),
+						Max:  resource.NewQuantity(int64(d.memoryBytes), resource.BinarySI),
 						Step: resource.NewQuantity(int64(1048576), resource.BinarySI),
 					},
 				},
@@ -121,59 +116,30 @@ func (d *HAMiGpuInfo) GetDevice() resourceapi.Device {
 	return device
 }
 
-
 // For nvlib.go
-func (l deviceLib) enumerateGpusDevicesForHAMiCore(config *Config) (AllocatableDevices, error) {
-	if err := l.Init(); err != nil {
-		return nil, err
+func (l deviceLib) wrapHAMiCoreGpu(parentDev *AllocatableDevice) *AllocatableDevice {
+	hamiGpuInfo := &HAMiGpuInfo{
+		GpuInfo: GpuInfo{
+			UUID:                  parentDev.Gpu.UUID,
+			minor:                 parentDev.Gpu.minor,
+			migEnabled:            parentDev.Gpu.migEnabled,
+			memoryBytes:           parentDev.Gpu.memoryBytes,
+			productName:           parentDev.Gpu.productName,
+			brand:                 parentDev.Gpu.brand,
+			architecture:          parentDev.Gpu.architecture,
+			cudaComputeCapability: parentDev.Gpu.cudaComputeCapability,
+			driverVersion:         parentDev.Gpu.driverVersion,
+			cudaDriverVersion:     parentDev.Gpu.cudaDriverVersion,
+			pcieBusID:             parentDev.Gpu.pcieBusID,
+			pcieRootAttr:          parentDev.Gpu.pcieRootAttr,
+			migProfiles:           parentDev.Gpu.migProfiles,
+			addressingMode:        parentDev.Gpu.addressingMode,
+			health:                parentDev.Gpu.health,
+		},
 	}
-	defer l.alwaysShutdown()
-
-	// splitCount := config.flags.hamiCoreDevSplitCount
-	devices := make(AllocatableDevices)
-	err := l.VisitDevices(func(i int, d nvdev.Device) error {
-		gpuInfo, err := l.getGpuInfo(i, d)
-		if err != nil {
-			return fmt.Errorf("error getting info for GPU %d: %w", i, err)
-		}
-
-		// for idx := range splitCount {
-		hamiGpuInfo := &HAMiGpuInfo{
-			GpuInfo: GpuInfo{
-				UUID:                  gpuInfo.UUID,
-				minor:                 gpuInfo.minor,
-				migEnabled:            gpuInfo.migEnabled,
-				memoryBytes:           gpuInfo.memoryBytes,
-				productName:           gpuInfo.productName,
-				brand:                 gpuInfo.brand,
-				architecture:          gpuInfo.architecture,
-				cudaComputeCapability: gpuInfo.cudaComputeCapability,
-				driverVersion:         gpuInfo.driverVersion,
-				cudaDriverVersion:     gpuInfo.cudaDriverVersion,
-				pcieBusID:             gpuInfo.pcieBusID,
-				pcieRootAttr:          gpuInfo.pcieRootAttr,
-				migProfiles:           gpuInfo.migProfiles,
-			},
-		}
-		deviceInfo := &AllocatableDevice{
-			HAMiGpu: hamiGpuInfo,
-		}
-		name := hamiGpuInfo.CanonicalName()
-		devices[name] = deviceInfo
-		// }
-
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("error visiting devices: %w", err)
-	}
-
-	// Debug:
-	for name := range devices {
-		klog.Infof("enumerateGpusDevicesForHAMiCore -- CanonicalName: %s", name)
-	}
-
-	return devices, nil
+	parentDev.HAMiGpu = hamiGpuInfo
+	parentDev.Gpu = nil
+	return parentDev
 }
 
 // For prepared.go
@@ -407,41 +373,3 @@ func (m *HAMiCoreManager) Cleanup(cacheDir string) error {
 
 // For types.go
 const HAMiGpuDeviceType = "hami-gpu"
-
-// For FeatureGates
-type FeatureGateConfig struct{}
-
-// NewFeatureGateConfig creates a new unified feature gate configuration.
-func newFeatureGateConfig() *FeatureGateConfig {
-	return &FeatureGateConfig{}
-}
-
-// Flags returns the CLI flags for the unified feature gate configuration.
-func (f *FeatureGateConfig) Flags() []cli.Flag {
-	var fs pflag.FlagSet
-
-	// Add the unified feature gates flag containing both project and logging features
-	fs.AddFlag(&pflag.Flag{
-		Name: "feature-gates",
-		Usage: "A set of key=value pairs that describe feature gates for alpha/experimental features. " +
-			"Options are:\n     " + strings.Join(featuregates.KnownFeatures(), "\n     "),
-		Value: featuregates.FeatureGates.(pflag.Value), //nolint:forcetypeassert // No need for type check: FeatureGates is a *featuregate.featureGate, which implements pflag.Value.
-	})
-
-	var flags []cli.Flag
-	fs.VisitAll(func(flag *pflag.Flag) {
-		flags = append(flags, pflagToCLI(flag, "Feature Gates:"))
-	})
-	return flags
-}
-
-func pflagToCLI(flag *pflag.Flag, category string) cli.Flag {
-	return &cli.GenericFlag{
-		Name:        flag.Name,
-		Category:    category,
-		Usage:       flag.Usage,
-		Value:       flag.Value,
-		Destination: flag.Value,
-		EnvVars:     []string{strings.ToUpper(strings.ReplaceAll(flag.Name, "-", "_"))},
-	}
-}

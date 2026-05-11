@@ -17,16 +17,17 @@
 package featuregates
 
 import (
+	"fmt"
 	"strings"
+	"sync"
 
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/component-base/featuregate"
 	logsapi "k8s.io/component-base/logs/api/v1"
 
-
-	info "github.com/Project-HAMi/k8s-dra-driver/pkg/version"
 	// "github.com/NVIDIA/k8s-dra-driver-gpu/internal/info"
+	info "github.com/Project-HAMi/k8s-dra-driver/pkg/version"
 )
 
 const (
@@ -44,11 +45,21 @@ const (
 
 	// PassthroughSupport allows gpus to be configured with the vfio-pci driver.
 	PassthroughSupport featuregate.Feature = "PassthroughSupport"
-)
 
-// FeatureGates is a singleton representing the set of all feature gates and their values.
-// It contains both project-specific feature gates and standard Kubernetes logging feature gates.
-var FeatureGates featuregate.MutableVersionedFeatureGate
+	// NVMLDeviceHealthCheck allows Device Health Checking using NVML.
+	NVMLDeviceHealthCheck featuregate.Feature = "NVMLDeviceHealthCheck"
+
+	// Enable dynamic MIG device management.
+	DynamicMIG featuregate.Feature = "DynamicMIG"
+
+	// ComputeDomainCliques enables using ComputeDomainClique CRD objects instead of
+	// storing daemon info directly in ComputeDomainStatus.Nodes.
+	ComputeDomainCliques featuregate.Feature = "ComputeDomainCliques"
+
+	// CrashOnNVLinkFabricErrors causes the kubelet plugin to crash instead of
+	// falling back to non-fabric mode when NVLink fabric errors are detected.
+	CrashOnNVLinkFabricErrors featuregate.Feature = "CrashOnNVLinkFabricErrors"
+)
 
 // defaultFeatureGates contains the default settings for all project-specific feature gates.
 // These will be registered with the standard Kubernetes feature gate system.
@@ -88,11 +99,51 @@ var defaultFeatureGates = map[featuregate.Feature]featuregate.VersionedSpecs{
 			Version:    version.MajorMinor(25, 12),
 		},
 	},
+	DynamicMIG: {
+		{
+			Default:    false,
+			PreRelease: featuregate.Alpha,
+			Version:    version.MajorMinor(25, 12),
+		},
+	},
+	NVMLDeviceHealthCheck: {
+		{
+			Default:    false,
+			PreRelease: featuregate.Alpha,
+			Version:    version.MajorMinor(25, 12),
+		},
+	},
+	ComputeDomainCliques: {
+		{
+			Default:    false,
+			PreRelease: featuregate.Beta,
+			Version:    version.MajorMinor(25, 12),
+		},
+	},
+	CrashOnNVLinkFabricErrors: {
+		{
+			Default:    true,
+			PreRelease: featuregate.Beta,
+			Version:    version.MajorMinor(25, 12),
+		},
+	},
 }
 
-// init instantiates and sets the singleton 'FeatureGates' variable with newFeatureGates().
-func init() {
-	FeatureGates = newFeatureGates(parseProjectVersion())
+var (
+	featureGatesOnce sync.Once
+	featureGates     featuregate.MutableVersionedFeatureGate
+)
+
+// FeatureGates instantiates and returns the package-level singleton representing
+// the set of all feature gates and their values.
+// It contains both project-specific feature gates and standard Kubernetes logging feature gates.
+func FeatureGates() featuregate.MutableVersionedFeatureGate {
+	if featureGates == nil {
+		featureGatesOnce.Do(func() {
+			featureGates = newFeatureGates(parseProjectVersion())
+		})
+	}
+	return featureGates
 }
 
 // parseProjectVersion parses the project version string and returns major.minor version.
@@ -125,15 +176,56 @@ func newFeatureGates(version *version.Version) featuregate.MutableVersionedFeatu
 	return fg
 }
 
+// ValidateFeatureGates validates feature gate dependencies and returns an error if
+// any dependencies are not satisfied.
+func ValidateFeatureGates() error {
+	// HAMiCOreSupport requirements
+	if Enabled(HAMiCoreSupport) {
+		if Enabled(TimeSlicingSettings) {
+			return fmt.Errorf("feature gate %s is currently mutually exclusive with %s", HAMiCoreSupport, TimeSlicingSettings)
+		}
+		if Enabled(MPSSupport) {
+			return fmt.Errorf("feature gate %s is currently mutually exclusive with %s", HAMiCoreSupport, MPSSupport)
+		}
+		if Enabled(PassthroughSupport) {
+			return fmt.Errorf("feature gate %s is currently mutually exclusive with %s", HAMiCoreSupport, PassthroughSupport)
+		}
+		if Enabled(DynamicMIG) {
+			return fmt.Errorf("feature gate %s is currently mutually exclusive with %s", HAMiCoreSupport, DynamicMIG)
+		}
+		if Enabled(ComputeDomainCliques) {
+			return fmt.Errorf("feature gate %s is currently mutually exclusive with %s", HAMiCoreSupport, ComputeDomainCliques)
+		}
+	}
+	// ComputeDomainCliques requires IMEXDaemonsWithDNSNames
+	if Enabled(ComputeDomainCliques) && !Enabled(IMEXDaemonsWithDNSNames) {
+		return fmt.Errorf("feature gate %s requires %s to also be enabled", ComputeDomainCliques, IMEXDaemonsWithDNSNames)
+	}
+
+	if Enabled(DynamicMIG) && Enabled(PassthroughSupport) {
+		return fmt.Errorf("feature gate %s is currently mutually exclusive with %s", DynamicMIG, PassthroughSupport)
+	}
+
+	if Enabled(DynamicMIG) && Enabled(NVMLDeviceHealthCheck) {
+		return fmt.Errorf("feature gate %s is currently mutually exclusive with %s", DynamicMIG, NVMLDeviceHealthCheck)
+	}
+
+	if Enabled(DynamicMIG) && Enabled(MPSSupport) {
+		return fmt.Errorf("feature gate %s is currently mutually exclusive with %s", DynamicMIG, MPSSupport)
+	}
+
+	return nil
+}
+
 // Enabled returns true if the specified feature gate is enabled in the global FeatureGates singleton.
 // This is a convenience function that uses the global feature gate registry.
 func Enabled(feature featuregate.Feature) bool {
-	return FeatureGates.Enabled(feature)
+	return FeatureGates().Enabled(feature)
 }
 
 // KnownFeatures returns a list of known feature gates with their descriptions.
 func KnownFeatures() []string {
-	return FeatureGates.KnownFeatures()
+	return FeatureGates().KnownFeatures()
 }
 
 // ToMap returns all known feature gates as a map[string]bool suitable for
@@ -141,8 +233,8 @@ func KnownFeatures() []string {
 // Returns an empty map if no feature gates are configured.
 func ToMap() map[string]bool {
 	result := make(map[string]bool)
-	for feature := range FeatureGates.GetAll() {
-		result[string(feature)] = FeatureGates.Enabled(feature)
+	for feature := range FeatureGates().GetAll() {
+		result[string(feature)] = FeatureGates().Enabled(feature)
 	}
 	return result
 }
