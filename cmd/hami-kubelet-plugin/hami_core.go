@@ -210,14 +210,32 @@ func (m *HAMiCoreManager) GetCDIContainerEdits(claim *resourceapi.ResourceClaim,
 		klog.Warningf("Failed to change mod of host directory for cachefile %s: %s", cacheFileHostDirectory, err)
 	}
 
+	// Node-wide registry for cross-container GPU sharing. Unlike the per-claim cache above,
+	// this one file is shared by every container on the node: each registers its request and
+	// liveness, and the in-container limiter groups them by GPU UUID to work out its share.
+	registryHostDirectory := fmt.Sprintf("%s/vgpu/registry", m.hostHookPath)
+	if err = os.MkdirAll(registryHostDirectory, 0777); err != nil {
+		klog.Warningf("Failed to create host directory for share registry %s: %s", registryHostDirectory, err)
+	}
+	if err = os.Chmod(registryHostDirectory, 0777); err != nil {
+		klog.Warningf("Failed to change mod of host directory for share registry %s: %s", registryHostDirectory, err)
+	}
+
 	hamiEnvs := []string{}
 	// TOOD: Get SM Limit from Claim's Annotation
 	hamiEnvs = append(hamiEnvs, fmt.Sprintf("CUDA_DEVICE_MEMORY_SHARED_CACHE=%s", fmt.Sprintf("%s/%v.cache", cacheFileHostDirectory, uuid.New().String())))
+	hamiEnvs = append(hamiEnvs, fmt.Sprintf("NODE_SHARED_CACHE=%s/node.bin", registryHostDirectory))
 
 	devCapMap := m.getConsumableCapacityMap(claim)
 	idx := 0
-	for name, dev := range devs {
-		// TODO: The idx here may not equals to the index in nvidia-smi, So we need to find a solution to solve it
+	// Go randomizes map iteration, so iterating devs directly would bind CUDA_DEVICE_SM_LIMIT_<idx>
+	// and GPU_UUID_<idx> to a different physical GPU on every Prepare of a multi-GPU claim.
+	// Sorted keys make the assignment stable.
+	for _, name := range slices.Sorted(maps.Keys(devs)) {
+		dev := devs[name]
+		// TODO: idx is stable but still not guaranteed to equal the container's CUDA ordinal,
+		// which CUDA derives from CUDA_DEVICE_ORDER. GPU_UUID_<idx> lets the in-container
+		// limiter detect a mismatch rather than silently group against the wrong GPU.
 		klog.Warningf("HAMiCoreManager GetCDIContainerEdits for dev: %s\n", name)
 		capNameSMLimit := resourceapi.QualifiedName("cores")
 		capNameMemoryLimit := resourceapi.QualifiedName("memory")
@@ -241,7 +259,11 @@ func (m *HAMiCoreManager) GetCDIContainerEdits(claim *resourceapi.ResourceClaim,
 				}
 			}
 		}
-		hamiEnvs = append(hamiEnvs, SMLimitEnv, MemoryLimitEnv)
+		// Physical GPU identity. The CUDA index above is container-relative -- two containers
+		// holding different GPUs both see index 0 -- so the in-container limiter cannot use it
+		// to tell which containers share a card. The UUID is node-global and stable.
+		UUIDEnv := fmt.Sprintf("GPU_UUID_%d=%s", idx, dev.HAMiGpu.UUID)
+		hamiEnvs = append(hamiEnvs, SMLimitEnv, MemoryLimitEnv, UUIDEnv)
 		idx++
 	}
 
@@ -258,6 +280,13 @@ func (m *HAMiCoreManager) GetCDIContainerEdits(claim *resourceapi.ResourceClaim,
 					ContainerPath: m.hostHookPath + "/vgpu/libvgpu.so",
 					HostPath:      m.hostHookPath + "/vgpu/libvgpu.so",
 					Options:       []string{"ro", "nosuid", "nodev", "bind"},
+				},
+				// Shared by every container on the node, hence rw and the same path on both
+				// sides -- NODE_SHARED_CACHE above points into it.
+				{
+					ContainerPath: registryHostDirectory,
+					HostPath:      registryHostDirectory,
+					Options:       []string{"rw", "nosuid", "nodev", "bind"},
 				},
 				// TODO: Check CUDA_DISABLE_CONTROL env before mount ld.so.preload
 				{
